@@ -176,7 +176,14 @@ def route_to_vendor(method: str, *args, **kwargs):
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
+            result = impl_func(*args, **kwargs)
+
+            # Post-process fundamentals to remove look-ahead bias for historical dates
+            if method == "get_fundamentals" and result and len(args) >= 2 and args[1]:
+                from .fundamentals_backtest import process_fundamentals_for_date
+                result = process_fundamentals_for_date(result, args[0], args[1])
+
+            return result
         except AlphaVantageRateLimitError:
             continue  # Only rate limits trigger fallback
 

@@ -10,17 +10,55 @@ from .alpha_vantage_common import AlphaVantageRateLimitError
 API_BASE_URL = "https://api.twelvedata.com"
 
 # Rate limit: 8 requests per minute for free tier
-_last_request_time = 0
-_MIN_REQUEST_INTERVAL = 8.0  # seconds between requests
+_MIN_REQUEST_INTERVAL = 8.0  # seconds between requests per key
+
+# Per-key rate limiting: maps key suffix -> last request timestamp
+_key_last_request: dict[str, float] = {}
+_api_keys: list[str] = []
+_current_key_idx = 0
 
 
-def _rate_limit_throttle():
-    """Ensure minimum interval between API requests."""
-    global _last_request_time
-    elapsed = time.time() - _last_request_time
+def _load_api_keys():
+    """Load API keys from env (comma-separated for rotation)."""
+    global _api_keys
+    if _api_keys:
+        return
+    raw = os.getenv("TWELVE_DATA_API_KEY", "")
+    _api_keys = [k.strip() for k in raw.split(",") if k.strip()]
+    if not _api_keys:
+        raise ValueError("TWELVE_DATA_API_KEY environment variable is not set.")
+
+
+def _pick_key() -> str:
+    """Pick the API key with the longest idle time (round-robin with smart selection)."""
+    _load_api_keys()
+    if len(_api_keys) == 1:
+        return _api_keys[0]
+
+    now = time.time()
+    best_key = None
+    best_idle = -1
+
+    for key in _api_keys:
+        suffix = key[-6:]
+        last = _key_last_request.get(suffix, 0)
+        idle = now - last
+        if idle > best_idle:
+            best_idle = idle
+            best_key = key
+
+    return best_key
+
+
+def _rate_limit_throttle(key: str):
+    """Ensure minimum interval per API key."""
+    suffix = key[-6:]
+    now = time.time()
+    last = _key_last_request.get(suffix, 0)
+    elapsed = now - last
     if elapsed < _MIN_REQUEST_INTERVAL:
         time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
-    _last_request_time = time.time()
+    _key_last_request[suffix] = time.time()
 
 
 class TwelveDataRateLimitError(AlphaVantageRateLimitError):
@@ -30,11 +68,8 @@ class TwelveDataRateLimitError(AlphaVantageRateLimitError):
 
 
 def get_api_key() -> str:
-    """Retrieve the API key for Twelve Data from environment variables."""
-    api_key = os.getenv("TWELVE_DATA_API_KEY")
-    if not api_key:
-        raise ValueError("TWELVE_DATA_API_KEY environment variable is not set.")
-    return api_key
+    """Retrieve the best available API key (round-robin across multiple keys)."""
+    return _pick_key()
 
 
 def _make_api_request(endpoint: str, params: dict = None) -> dict:
@@ -45,9 +80,10 @@ def _make_api_request(endpoint: str, params: dict = None) -> dict:
     """
     if params is None:
         params = {}
-    params["apikey"] = get_api_key()
+    api_key = get_api_key()
+    params["apikey"] = api_key
 
-    _rate_limit_throttle()
+    _rate_limit_throttle(api_key)
 
     url = f"{API_BASE_URL}/{endpoint}"
     response = requests.get(url, params=params)

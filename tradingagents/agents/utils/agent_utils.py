@@ -148,6 +148,14 @@ def build_portfolio_context(portfolio_str: str) -> str:
     if risk:
         lines.append(f"  - Risk tolerance: {risk}")
 
+    style = portfolio.get("investment_style")
+    if style:
+        lines.append(f"  - Investment style: {style}")
+
+    cash_strategy = portfolio.get("cash_strategy")
+    if cash_strategy:
+        lines.append(f"  - Cash strategy: {cash_strategy}")
+
     # --- Concentration warning ---
     top = max(computed_positions, key=lambda p: p["current_value"]) if computed_positions else None
     if top and total_portfolio:

@@ -35,4 +35,6 @@ DEFAULT_CONFIG = {
     "tool_vendors": {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
     },
+    # User portfolio context (JSON string, injected into Trader & Portfolio Manager)
+    "user_portfolio": "",
 }

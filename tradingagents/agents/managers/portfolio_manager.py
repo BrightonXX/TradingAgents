@@ -1,10 +1,11 @@
-from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction
+from tradingagents.agents.utils.agent_utils import build_instrument_context, build_portfolio_context, get_language_instruction
 
 
 def create_portfolio_manager(llm, memory):
     def portfolio_manager_node(state) -> dict:
 
         instrument_context = build_instrument_context(state["company_of_interest"])
+        portfolio_context = build_portfolio_context(state.get("user_portfolio", ""))
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
@@ -39,6 +40,7 @@ def create_portfolio_manager(llm, memory):
 - Research Manager's investment plan: **{research_plan}**
 - Trader's transaction proposal: **{trader_plan}**
 - Lessons from past decisions: **{past_memory_str}**
+{portfolio_context}
 
 **Required Output Structure:**
 1. **Rating**: State one of Buy / Overweight / Hold / Underweight / Sell.

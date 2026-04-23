@@ -1,0 +1,13 @@
+{
+  "positions": [
+    {"ticker": "NVDA", "shares": 90, "cost_basis_usd": 180.91, "current_price_usd": 202.50},
+    {"ticker": "MSFT", "shares": 30, "cost_basis_usd": 419.31, "current_price_usd": 432.92},
+    {"ticker": "MU", "shares": 19, "cost_basis_usd": 411.66, "current_price_usd": 487.48},
+    {"ticker": "VPU", "shares": 20, "cost_basis_usd": 203.89, "current_price_usd": 194.34},
+    {"ticker": "NASA", "shares": 100, "cost_basis_usd": 27.88, "current_price_usd": 31.59},
+    {"ticker": "AAPL", "shares": 10, "cost_basis_usd": 257.47, "current_price_usd": 273.17}
+  ],
+  "cash_usd": 30300,
+  "risk_tolerance": "moderate",
+  "_note": "Update current_price_usd and cash_usd before each run. Shares and cost_basis_usd change only on trades."
+}

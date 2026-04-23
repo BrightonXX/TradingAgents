@@ -61,6 +61,7 @@ class TradingAgentsGraph:
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        self.user_portfolio = self.config.get("user_portfolio", "")
 
         # Update the interface's config
         set_config(self.config)
@@ -198,7 +199,7 @@ class TradingAgentsGraph:
 
         # Initialize state
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date
+            company_name, trade_date, self.user_portfolio
         )
         args = self.propagator.get_graph_args()
 

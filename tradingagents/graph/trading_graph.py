@@ -1,10 +1,12 @@
 # TradingAgents/graph/trading_graph.py
 
 import os
+import time
 from pathlib import Path
 import json
 from datetime import date
 from typing import Dict, Any, Tuple, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langgraph.prebuilt import ToolNode
 
@@ -49,6 +51,7 @@ class TradingAgentsGraph:
         debug=False,
         config: Dict[str, Any] = None,
         callbacks: Optional[List] = None,
+        parallel: bool = False,
     ):
         """Initialize the trading agents graph and components.
 
@@ -57,11 +60,14 @@ class TradingAgentsGraph:
             debug: Whether to run in debug mode
             config: Configuration dictionary. If None, uses default config
             callbacks: Optional list of callback handlers (e.g., for tracking LLM/tool stats)
+            parallel: If True, run analysts concurrently via ThreadPoolExecutor
         """
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
         self.user_portfolio = self.config.get("user_portfolio", "")
+        self.parallel = parallel
+        self.selected_analysts = selected_analysts
 
         # Update the interface's config
         set_config(self.config)
@@ -94,7 +100,7 @@ class TradingAgentsGraph:
 
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
-        
+
         # Initialize memories
         self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
         self.bear_memory = FinancialSituationMemory("bear_memory", self.config)
@@ -132,7 +138,21 @@ class TradingAgentsGraph:
         self.log_states_dict = {}  # date to full state dict
 
         # Set up the graph
-        self.graph = self.graph_setup.setup_graph(selected_analysts)
+        if self.parallel:
+            (
+                self.analyst_subgraphs,
+                self.report_key_map,
+                self.invest_debate_graph,
+                self.risk_debate_graph,
+                self.trader_pm_graph,
+            ) = self.graph_setup.setup_parallel(selected_analysts)
+            self.graph = None
+        else:
+            self.graph = self.graph_setup.setup_graph(selected_analysts)
+            self.analyst_subgraphs = None
+            self.invest_debate_graph = None
+            self.risk_debate_graph = None
+            self.trader_pm_graph = None
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
@@ -203,7 +223,9 @@ class TradingAgentsGraph:
         )
         args = self.propagator.get_graph_args()
 
-        if self.debug:
+        if self.parallel:
+            final_state = self._propagate_parallel(init_agent_state, args)
+        elif self.debug:
             # Debug mode with tracing
             trace = []
             for chunk in self.graph.stream(init_agent_state, **args):
@@ -288,3 +310,197 @@ class TradingAgentsGraph:
     def process_signal(self, full_signal):
         """Process a signal to extract the core decision."""
         return self.signal_processor.process_signal(full_signal)
+
+    # ------------------------------------------------------------------
+    # Parallel analyst execution
+    # ------------------------------------------------------------------
+    def _propagate_parallel(self, init_state, args):
+        """Run analysts in parallel, then run the debate graph.
+
+        Each analyst runs in its own thread with its own sub-graph.
+        Individual analyst failures are retried independently so a single
+        failure doesn't discard the work of the other analysts.
+        """
+        import random
+
+        max_retries = 3
+        base_backoff = 8  # seconds
+
+        # --- Phase 1: Run analyst sub-graphs in parallel (2 batches) ---
+        print("Phase 1: Running analysts in parallel...", flush=True)
+        results = {}
+        timings = {}
+        t0 = time.time()
+
+        def _run_one(name, graph):
+            """Run a single analyst sub-graph with retry logic."""
+            print(f"  [{name}] starting...", flush=True)
+            for attempt in range(1, max_retries + 1):
+                try:
+                    t = time.time()
+                    result = graph.invoke(init_state)
+                    elapsed = time.time() - t
+                    return name, result, elapsed, None
+                except Exception as exc:
+                    err_msg = str(exc).lower()
+                    is_rate_limit = "429" in err_msg or "rate" in err_msg or "overload" in err_msg
+                    if is_rate_limit and attempt < max_retries:
+                        wait = base_backoff * (2 ** (attempt - 1)) + random.uniform(0, 2)
+                        print(f"  [{name}] rate-limited (attempt {attempt}/{max_retries}), "
+                              f"retrying in {wait:.1f}s...")
+                        time.sleep(wait)
+                        continue
+                    return name, None, 0, exc
+            return name, None, 0, RuntimeError(f"{name}: exhausted retries")
+
+        # Run in batches of 2 to avoid overwhelming yfinance / API proxy
+        analyst_items = list(self.analyst_subgraphs.items())
+        max_concurrent = 2
+        for batch_start in range(0, len(analyst_items), max_concurrent):
+            batch = analyst_items[batch_start:batch_start + max_concurrent]
+            batch_names = [n for n, _ in batch]
+            print(f"  Batch ({', '.join(batch_names)})...", flush=True)
+            with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+                futures = {
+                    pool.submit(_run_one, name, graph): name
+                    for name, graph in batch
+                }
+                for future in as_completed(futures):
+                    name, result, elapsed, error = future.result()
+                    if error:
+                        print(f"  [{name}] FAILED: {error}", flush=True)
+                        results[name] = {}
+                    else:
+                        report_key = self.report_key_map.get(name, "")
+                        report_val = result.get(report_key, "") if result else ""
+                        print(f"  [{name}] done in {elapsed:.1f}s "
+                              f"({len(report_val)} chars)", flush=True)
+                        results[name] = result
+                        timings[name] = elapsed
+
+        analyst_elapsed = time.time() - t0
+        print(f"Phase 1 complete: {analyst_elapsed:.1f}s "
+              f"(wall-clock for {len(timings)} analysts)\n", flush=True)
+
+        # Merge reports into a state dict for the debate tracks
+        merged = dict(init_state)
+        for name, result in results.items():
+            key = self.report_key_map.get(name)
+            if key and result:
+                merged[key] = result.get(key, "")
+
+        # Brief cooldown to avoid rate limits between phases
+        print("Cooling down 10s...", flush=True)
+        time.sleep(10)
+
+        # --- Phase 2: Two debate tracks in parallel ---
+        print("Phase 2: Running debate tracks in parallel...", flush=True)
+        t2 = time.time()
+
+        # Track A: invest debate uses merged state as-is
+        invest_state = dict(merged)
+
+        # Track B: risk debate needs a placeholder trader plan since Trader
+        # hasn't run yet.  The debators use it as context but their core
+        # arguments come from the analyst reports.
+        risk_state = dict(merged)
+        if not risk_state.get("trader_investment_plan"):
+            risk_state["trader_investment_plan"] = (
+                "No specific trader plan yet — assess risk/reward based on "
+                "the analyst reports provided."
+            )
+
+        def _run_graph(tag, graph, state):
+            for attempt in range(1, max_retries + 1):
+                try:
+                    t = time.time()
+                    result = graph.invoke(state)
+                    elapsed = time.time() - t
+                    return tag, result, elapsed, None
+                except Exception as exc:
+                    err_msg = str(exc).lower()
+                    is_rl = "429" in err_msg or "rate" in err_msg or "overload" in err_msg
+                    if is_rl and attempt < max_retries:
+                        wait = base_backoff * (2 ** (attempt - 1)) + random.uniform(0, 2)
+                        print(f"  [{tag}] rate-limited (attempt {attempt}), "
+                              f"retry {wait:.0f}s...", flush=True)
+                        time.sleep(wait)
+                        continue
+                    return tag, None, 0, exc
+            return tag, None, 0, RuntimeError(f"{tag}: exhausted retries")
+
+        debate_results = {}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futs = {
+                pool.submit(_run_graph, "invest_debate", self.invest_debate_graph, invest_state): "invest",
+                pool.submit(_run_graph, "risk_debate", self.risk_debate_graph, risk_state): "risk",
+            }
+            for f in as_completed(futs):
+                tag, result, elapsed, error = f.result()
+                if error:
+                    print(f"  [{tag}] FAILED: {error}", flush=True)
+                else:
+                    print(f"  [{tag}] done in {elapsed:.1f}s", flush=True)
+                    debate_results[tag] = (result, elapsed)
+
+        debate_elapsed = time.time() - t2
+        print(f"Phase 2 complete: {debate_elapsed:.1f}s\n", flush=True)
+
+        # Merge debate results into a single state for Trader + PM
+        pm_state = dict(merged)
+        invest_r, _ = debate_results.get("invest_debate", ({}, 0))
+        risk_r, _ = debate_results.get("risk_debate", ({}, 0))
+        if invest_r:
+            for k in ("investment_debate_state", "investment_plan"):
+                if k in invest_r:
+                    pm_state[k] = invest_r[k]
+        if risk_r:
+            if "risk_debate_state" in risk_r:
+                pm_state["risk_debate_state"] = risk_r["risk_debate_state"]
+
+        # --- Phase 3: Trader → Portfolio Manager ---
+        print("Phase 3: Trader → Portfolio Manager...", flush=True)
+        t3 = time.time()
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                trace = []
+                _last_t = t3
+                for chunk in self.trader_pm_graph.stream(pm_state, **args):
+                    for node_name in chunk:
+                        if node_name.startswith("__"):
+                            continue
+                        now = time.time()
+                        dt = now - _last_t
+                        print(f"  [{node_name}] {dt:.0f}s", flush=True)
+                        _last_t = now
+                    trace.append(chunk)
+                final_state = trace[-1] if trace else pm_state
+                break
+            except Exception as exc:
+                err_msg = str(exc).lower()
+                is_rl = "429" in err_msg or "rate" in err_msg or "overload" in err_msg
+                if is_rl and attempt < max_retries:
+                    wait = base_backoff * (2 ** (attempt - 1)) + random.uniform(0, 2)
+                    print(f"  Trader/PM rate-limited (attempt {attempt}), "
+                          f"retry {wait:.0f}s...", flush=True)
+                    time.sleep(wait)
+                    continue
+                raise
+
+        pm_elapsed = time.time() - t3
+        total_elapsed = time.time() - t0
+        print(f"\n{'='*50}", flush=True)
+        print(f"  Analysts:  {analyst_elapsed:.0f}s", flush=True)
+        print(f"  Debates:   {debate_elapsed:.0f}s  (parallel)", flush=True)
+        print(f"  Trader+PM: {pm_elapsed:.0f}s", flush=True)
+        print(f"  TOTAL:     {total_elapsed:.0f}s", flush=True)
+        print(f"{'='*50}\n", flush=True)
+
+        # Ensure analyst reports are in final state
+        for name, result in results.items():
+            key = self.report_key_map.get(name)
+            if key and result and key not in final_state:
+                final_state[key] = result.get(key, "")
+
+        return final_state

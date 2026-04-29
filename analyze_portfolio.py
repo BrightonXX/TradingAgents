@@ -598,14 +598,10 @@ def main():
     print(f"\nFetching market data...", flush=True)
     stock_data = []
     for ticker in tickers:
-        if ticker in reports:
-            print(f"  {ticker}: using cached", flush=True)
-            stock_data.append({'ticker': ticker})
-        else:
-            print(f"  {ticker}: fetching...", end="", flush=True)
-            data = fetch_stock_data(ticker)
-            print(f" ${data.get('current_price', 'ERR')}", flush=True)
-            stock_data.append(data)
+        print(f"  {ticker}: fetching...", end="", flush=True)
+        data = fetch_stock_data(ticker)
+        print(f" ${data.get('current_price', 'ERR')}", flush=True)
+        stock_data.append(data)
 
     position_cards, total_value = build_position_cards(portfolio, stock_data, reports)
 
